@@ -9,6 +9,8 @@ import torchvision.datasets as datasets
 from model import Backbone, ArcFace, FocalLoss
 from torch.utils.tensorboard import SummaryWriter
 
+import config
+
 
 def make_weights_for_balanced_classes(images, nclasses):
     count = [0] * nclasses
@@ -93,13 +95,23 @@ def train(args):
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=args.batch_size, num_workers=8, shuffle=True, drop_last=True)
     NUM_CLASS = len(train_loader.dataset.classes)
 
-    BACKBONE = Backbone([args.input_size, args.input_size])
+    BACKBONE = Backbone([args.input_size, args.input_size], args.num_layers, args.mode)
     HEAD = ArcFace(args.emb_dims, NUM_CLASS, device_id=args.gpu)
     LOSS = FocalLoss()
     backbone_paras_only_bn, backbone_paras_wo_bn = separate_irse_bn_paras(BACKBONE)
     _, head_paras_wo_bn = separate_irse_bn_paras(HEAD)
     optimizer = optim.SGD([{'params': backbone_paras_wo_bn+head_paras_wo_bn, 'weight_decay': args.weight_decay},
                         {'params': backbone_paras_only_bn}], lr=args.lr, momentum=args.momentum)
+    # optimizer = optim.AdamW([{'params': backbone_paras_wo_bn+head_paras_wo_bn, 'weight_decay': args.weight_decay},
+    #                     {'params': backbone_paras_only_bn}], lr=args.lr, momentum=args.momentum)
+    
+    if args.load_ckpt:
+        BACKBONE.load_state_dict(torch.load(os.path.join(args.load_ckpt, 'backbone_epoch{}.pth'.format(args.load_epoch))))
+        HEAD.load_state_dict(torch.load(os.path.join(args.load_ckpt, 'head_epoch{}.pth'.format(args.load_epoch))))
+        print('Checkpoint loaded')
+    
+    start_epoch = args.load_epoch if args.load_ckpt else 0
+
     BACKBONE = nn.DataParallel(BACKBONE, device_ids=args.gpu)
     BACKBONE = BACKBONE.to(DEVICE)
 
@@ -108,7 +120,7 @@ def train(args):
     NUM_BATCH_WARM_UP = len(train_loader) * NUM_EPOCH_WARM_UP
     batch = 0
     print('Start training at %s!' % datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
-    for epoch in range(args.num_epoch):
+    for epoch in range(start_epoch, args.num_epoch):
         if epoch==args.stages[0] or epoch==args.stages[1] or epoch==args.stages[2]:
             for params in optimizer.param_groups:
                 params['lr'] /= 10.
@@ -145,23 +157,31 @@ def train(args):
 
 
 if __name__ == '__main__':
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
+    os.environ['CUDA_VISIBLE_DEVICES'] = '6,7,8'
+    num_gpus = len(os.environ['CUDA_VISIBLE_DEVICES'].split(','))
+
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data_root', type=str, default='data/CASIA-clean-112')
-    parser.add_argument('--ckpt_root', type=str, default='ckpt')
-    parser.add_argument('--log_root', type=str, default='log')
-    parser.add_argument('--gpu', type=list, default=[0])
+    parser.add_argument('--data_root', type=str, default=config.TRAIN_DATA)
+    parser.add_argument('--ckpt_root', type=str, default=config.CKPT_ROOT)
+    parser.add_argument('--log_root', type=str, default=config.LOG_ROOT)
+    parser.add_argument('--load_ckpt', type=str, default=config.LOAD_CKPT)
+    parser.add_argument('--load_epoch', type=int, default=config.LOAD_EPOCH)
+    parser.add_argument('--gpu', type=list, default=list(range(num_gpus)))
     parser.add_argument('--input_size', type=int, default=112)
     parser.add_argument('--rgb_mean', type=float, default=0.5)
     parser.add_argument('--rgb_std', type=float, default=0.5)
     parser.add_argument('--emb_dims', type=int, default=512)
-    parser.add_argument('--batch_size', type=int, default=32)
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--num_epoch', type=int, default=125)
     parser.add_argument('--weight_decay', type=float, default=5e-4)
     parser.add_argument('--momentum', type=float, default=0.9)
     parser.add_argument('--stages', type=list, default=[35, 65, 95])
+    parser.add_argument('--num_layers', type=int, default=50, choices=(50, 100, 152))
+    parser.add_argument('--mode', type=str, default='ir', choices=('ir', 'ir_se'))
     args = parser.parse_args()
-    print(str(args))
+    # print(str(args))
     os.makedirs(args.ckpt_root, exist_ok=True)
     os.makedirs(args.log_root, exist_ok=True)
     train(args)
